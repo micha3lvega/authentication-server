@@ -1,0 +1,355 @@
+pipeline {
+
+    agent any
+
+    options { buildDiscarder(logRotator(numToKeepStr: '10')) }
+
+    environment {
+        URLCURRENTVERSIONS="https://docs.google.com/spreadsheets/u/1/d/1izBe4YP9wUXSdQaT2ut4OFB8-FMSQy1ZLVonOgUXImo/export?format=csv"
+        
+        APPLICATIONNAME = "authentication-server"
+        POMPATH = "."
+        JENKINSFILEPATH = "authentication-server"
+
+        DEVIP = "10.170.0.100"
+        DEVUSER = "taf-deploy"
+        DEVPASSWORD = "T4f100-S3cur3,L4p1n"
+        DEVIMAGES = "10.170.0.100"
+
+        PREIP = "10.170.0.45"
+        PREUSER = "taf-deploy"
+        PREPASSWORD = "T4f45-S3cur3,L4p1n"
+        PREIMAGES = "10.170.0.246"
+    }
+
+    stages {
+
+        stage ('Check Project Branch To Deploy') {
+            when {
+                anyOf { branch "*-SNAPSHOT"; branch "*-RC"}
+            } 
+            steps {
+                script {
+                    try {
+                        def appName = "${APPLICATIONNAME}"
+                        def urlCurrentVersions = "${URLCURRENTVERSIONS}"
+                        def branchName = "${env.BRANCH_NAME}"
+                        def delefeFile = sh script:"if [ -e file.csv ];then rm file.csv;fi;", returnStdout: true
+                        def checkProjectBranchToDeploy = sh script:"python3 /var/jenkins_home/checkProjectBranchToDeploy.py ${branchName} ${appName} '${urlCurrentVersions}'", returnStdout: true
+                    } catch (e) {
+                        currentBuild.result = "FAILED"
+                        notifyBuild(currentBuild.result)
+                        throw e
+                    }
+                }
+            }
+        }
+
+        stage ('Start Notification') {
+            when {
+                anyOf { branch "*-SNAPSHOT"; branch "*-RC"}
+            } 
+            steps{
+                notifyBuild('STARTED')
+            }
+        }
+
+        stage('Compile Vaadin Widgetset') {
+            when {
+                anyOf { branch "*-SNAPSHOT"; branch "*-RC"}
+            }        
+            options { retry(2) }
+            steps {
+                script {
+                    def applicationName = "${APPLICATIONNAME}"
+                    if ( applicationName == 'merchant-front' || applicationName == 'advocate-front') {
+                        try {
+                            sh '''
+                                export POMPATH=$POMPATH
+                                mvn -f ./${POMPATH} clean install -U
+                                mvn -f ./${POMPATH} vaadin:update-widgetset
+                                mvn -f ./${POMPATH} vaadin:compile
+                            '''
+                        } catch (e) {
+                            currentBuild.result = "FAILED"
+                            notifyBuild(currentBuild.result)
+                            throw e
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Maven Install') {
+            when {
+                anyOf { branch "*-SNAPSHOT"; branch "*-RC"}
+            }        
+            options { retry(2) }
+            steps {
+                script {
+                    try {
+                        sh '''
+                            export POMPATH=$POMPATH
+                            mvn -B -DskipTests -f ./${POMPATH} clean install -U
+                        '''
+                    } catch (e) {
+                        currentBuild.result = "FAILED"
+                        notifyBuild(currentBuild.result)
+                        throw e
+                    }
+                }
+            }
+        }
+        
+        stage('Check Version and Docker Build') {
+            options { retry(2) }
+            parallel {
+                stage('Pre Environment') {
+                    when {
+                        anyOf { branch "*-RC" }
+                    }
+                    environment{
+                        VERSION = "${applicationVersion("${PREIMAGES}")}"
+                    }
+                    steps {
+                        script{
+                            try {
+                                def applicationName = "${APPLICATIONNAME}"
+                                def version = "${VERSION}"
+                                def jenkinsfilepath = "${JENKINSFILEPATH}"
+                                def dockerBuild = sh script:"docker build -t ${applicationName.toLowerCase()}:${version} --no-cache=true ./${jenkinsfilepath}", returnStdout: false
+                            } catch (e) {
+                                currentBuild.result = "FAILED"
+                                notifyBuild(currentBuild.result)
+                                throw e
+                            }
+                        }
+                    }
+                }
+
+                stage('Dev Environment') {
+                    when {
+                        anyOf { branch "*-SNAPSHOT" }
+                    }
+                    environment{
+                        VERSION = "${applicationVersion("${DEVIMAGES}")}"
+                    }
+                    steps {
+                        script{
+                            try {
+                                def applicationName = "${APPLICATIONNAME}"
+                                def version = "${VERSION}"
+                                def jenkinsfilepath = "${JENKINSFILEPATH}"
+                                def dockerBuild = sh script:"docker build -t ${applicationName.toLowerCase()}:${version} --no-cache=true ./${jenkinsfilepath}", returnStdout: false
+                            } catch (e) {
+                                currentBuild.result = "FAILED"
+                                notifyBuild(currentBuild.result)
+                                throw e
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Docker Push'){
+            options { retry(2) }
+            parallel {
+                stage('Pre Environment') {
+                    when {
+                        anyOf { branch "*-RC" }
+                    }
+                    environment {
+                        VERSION = "${applicationVersion("${PREIMAGES}")}"
+                    }
+                    steps {
+                        script {
+                            try {
+                                def applicationName = "${APPLICATIONNAME}"
+                                def version = "${VERSION}"
+                                def dockerTagImage = sh script:"docker tag ${applicationName.toLowerCase()}:${version} docker-registry-pre:5000/${applicationName.toLowerCase()}:${version}", returnStdout: false
+                                def dockerTagImageLatest = sh script:"docker tag ${applicationName.toLowerCase()}:${version} docker-registry-pre:5000/${applicationName.toLowerCase()}:latest", returnStdout: false
+                                def dockerPush1 = sh script:"docker push docker-registry-pre:5000/${applicationName.toLowerCase()}:${version}", returnStdout: false
+                                def dockerPush2 = sh script:"docker push docker-registry-pre:5000/${applicationName.toLowerCase()}:latest", returnStdout: false
+                            } catch (e) {
+                                currentBuild.result = "FAILED"
+                                notifyBuild(currentBuild.result)
+                                throw e
+                            }
+                        }
+                    }
+                }
+
+                stage('Dev Environment') {
+                    when {
+                        anyOf { branch "*-SNAPSHOT" }
+                    }
+                    environment {
+                        VERSION = "${applicationVersion("${DEVIMAGES}")}"
+                    }
+                    steps {
+                        script {
+                            try {
+                                def applicationName = "${APPLICATIONNAME}"
+                                def version = "${VERSION}"
+                                def dockerTagImage = sh script:"docker tag ${applicationName.toLowerCase()}:${version} docker-registry-dev:5000/${applicationName.toLowerCase()}:${version}", returnStdout: false
+                                def dockerTagImageLatest = sh script:"docker tag ${applicationName.toLowerCase()}:${version} docker-registry-dev:5000/${applicationName.toLowerCase()}:latest", returnStdout: false
+                                def dockerPush1 = sh script:"docker push docker-registry-dev:5000/${applicationName.toLowerCase()}:${version}", returnStdout: false
+                                def dockerPush2 = sh script:"docker push docker-registry-dev:5000/${applicationName.toLowerCase()}:latest", returnStdout: false
+                            } catch (e) {
+                                currentBuild.result = "FAILED"
+                                notifyBuild(currentBuild.result)
+                                throw e
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Docker Compose Pull') {
+            options { retry(2) }
+            parallel {     
+                stage('Dev Environment') {            
+                    when {
+                        anyOf { branch "*-SNAPSHOT" }
+                    }
+                    steps {
+                        script{
+                            try {
+                                def applicationName = "${APPLICATIONNAME}"
+                                def ip = "${DEVIP}"
+                                def user = "${DEVUSER}"
+                                def password = "${DEVPASSWORD}"
+                                def remote = [:]
+                                remote.name = 'dev'
+                                remote.host = "${ip}"
+                                remote.port = 6922
+                                remote.user = "${user}"
+                                remote.password = "${password}"
+                                remote.allowAnyHosts = true
+                                sshCommand remote: remote, command: "docker pull docker-registry:5000/${applicationName.toLowerCase()}:latest", sudo: true
+                            } catch (e) {
+                                currentBuild.result = "FAILED"
+                                notifyBuild(currentBuild.result)
+                                throw e
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Docker Compose Update') {
+            options { retry(2) }
+            parallel {
+                stage('Pre Environment') {
+                    when {
+                        anyOf { branch "*-RC" }
+                    }
+                    steps {
+                        script{
+                            try {
+                                def applicationName = "${APPLICATIONNAME}"
+                                def ip = "${PREIP}"
+                                def user = "${PREUSER}"
+                                def password = "${PREPASSWORD}"
+                                def remote = [:]
+                                remote.name = 'pre'
+                                remote.host = "${ip}"
+                                remote.port = 6922
+                                remote.user = "${user}"
+                                remote.password = "${password}"
+                                remote.allowAnyHosts = true
+                                sshCommand remote: remote, command: "docker service update pre-taf_${applicationName.toLowerCase()} --image docker-registry:5000/${applicationName.toLowerCase()}:latest", sudo: true
+                            } catch (e) {
+                                currentBuild.result = "FAILED"
+                                notifyBuild(currentBuild.result)
+                                throw e
+                            }
+                        }
+                    }
+                }
+
+                stage('Dev Environment') {
+                    when {
+                        anyOf { branch "*-SNAPSHOT" }
+                    }
+                    steps {
+                        script{
+                            try {
+                                def applicationName = "${APPLICATIONNAME}"
+                                def ip = "${DEVIP}"
+                                def user = "${DEVUSER}"
+                                def password = "${DEVPASSWORD}"
+                                def remote = [:]
+                                remote.name = 'dev'
+                                remote.host = "${ip}"
+                                remote.port = 6922
+                                remote.user = "${user}"
+                                remote.password = "${password}"
+                                remote.allowAnyHosts = true
+                                sshCommand remote: remote, command: "COMPOSE_HTTP_TIMEOUT=180 /usr/local/bin/docker-compose -p dev -f /home/taf/compose/dev-compose/docker-compose.yml up -d ${appName}", sudo: true
+                            } catch (e) {
+                                currentBuild.result = "FAILED"
+                                notifyBuild(currentBuild.result)
+                                throw e
+                            }
+                        }
+                    }
+                }
+            }
+        }      
+        
+        stage ('End Notification') {
+            when {
+                anyOf { branch "*-SNAPSHOT"; branch "*-RC"}
+            }
+            steps{
+                notifyBuild(currentBuild.result)
+            }
+        }           
+        
+    }
+}
+
+def applicationVersion(String envIp) {
+    envIp = envIp
+    def appName = "${APPLICATIONNAME}"
+    def pomPath = "${POMPATH}"
+    def version = sh script:"python /var/jenkins_home/1.py ./${pomPath}target/ ${envIp} ${appName}", returnStdout: true
+    //println "${version}"
+    return "${version}"
+}
+
+
+def notifyBuild(String buildStatus = 'STARTED') {
+  // build status of null means successful
+  buildStatus =  buildStatus ?: 'SUCCESSFUL'
+
+  def colorCode = '#ba1c1c'
+  def subject = "${buildStatus}: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'"
+  def summary = "${subject} (${env.BUILD_URL})"
+  
+  // Override default values based on build status
+  if (buildStatus == 'STARTED') {
+    // YELLOW
+    colorCode = '#f4ce42'
+  } else if (buildStatus == 'SUCCESSFUL') {
+    // GREEN
+    colorCode = '#1dba2a'
+  } else {
+    // RED
+    colorCode = '#ba1c1c'
+  }
+
+  details = """<p><span style="color:${colorCode};"><b>${buildStatus}</b>:</span> Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]':</p>
+    <p>Check console output at "<a href="${env.BUILD_URL}">${env.JOB_NAME} [${env.BUILD_NUMBER}]</a>"</p>"""   
+
+  // Send notifications
+  emailext (
+      subject: subject,
+      body: details,
+      to: 'erika.luque@telintel.net'
+    )
+}
